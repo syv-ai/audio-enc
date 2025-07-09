@@ -7,13 +7,13 @@ from transformers import AutoTokenizer
 import os
 from timestamps import transcribe_audio_array, split_audio_into_parts, get_text_from_transcription
 
-my_original_dataset_name = "CoRal-project/coral-tts"
-name_to_push_dataset_to = "syvai/coral-tts-zac-splits"
+my_original_dataset_name = "CoRal-project/coral-v2"
+name_to_push_dataset_to = "syvai/coral-v2-zac-splits"
 
 dsn = my_original_dataset_name
 
 # Stream the dataset instead of downloading
-ds = load_dataset(dsn, split="train", streaming=True)
+ds = load_dataset(dsn, "read_aloud", split="train", streaming=True)
 
 # Take first item to get sample rate
 first_item = next(iter(ds))
