@@ -150,7 +150,7 @@ def process_audio_splits(example, audio_column="audio", text_column="text", orig
             # Tokenize the audio part (resample to 24kHz for SNAC)
             try:
                 # Resample audio part to 24kHz for SNAC tokenization
-                audio_part_24k = resample_audio_for_snac(audio_part, target_sample_rate)
+                audio_part_24k = resample_audio_for_snac(audio_part, sample_rate)
                 codes_list = tokenise_audio(audio_part_24k, 24000)  # Already resampled to 24kHz
             except Exception as e:
                 print(f"Skipping {part_name} due to tokenization error: {e}")
