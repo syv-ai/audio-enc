@@ -113,10 +113,10 @@ def process_audio_splits(example, audio_column="audio", text_column="text", orig
         part_names = ["part1", "part2", "full"]
         
         # Calculate the duration of each part in seconds
-        target_sample_rate = 16000  # wav2vec2 uses 16kHz
+        # Note: audio_parts are still at the original sample rate, not 16kHz
         part_durations = []
         for audio_part in audio_parts:
-            duration = len(audio_part) / target_sample_rate
+            duration = len(audio_part) / sample_rate  # Use original sample rate
             part_durations.append(duration)
         
         for i, (audio_part, part_name, part_duration) in enumerate(zip(audio_parts, part_names, part_durations)):
@@ -165,7 +165,7 @@ def process_audio_splits(example, audio_column="audio", text_column="text", orig
                 "original_text": dataset_text,
             }
 
-            print(new_example)
+            print(f"Text before: {new_example['text_before']}, Text after: {new_example['text_after']}")
             
             processed_examples.append(new_example)
             
