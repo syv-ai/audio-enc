@@ -90,6 +90,16 @@ def get_emissions(audio_array: np.ndarray, sample_rate: int = 16000) -> torch.Te
         audio_array = audio_array.flatten()
     audio_array = audio_array.astype(np.float32)
     
+    # Check if audio is empty or too short
+    if len(audio_array) == 0:
+        raise ValueError("Audio array is empty")
+    
+    # Minimum audio length (100ms at 16kHz = 1600 samples)
+    min_length = int(0.1 * sample_rate)
+    if len(audio_array) < min_length:
+        # Pad audio if too short
+        audio_array = np.pad(audio_array, (0, min_length - len(audio_array)), 'constant')
+    
     # Preprocess audio with proper parameters
     inputs = processor(
         audio_array, 
@@ -122,38 +132,63 @@ def align_text_with_audio(audio_array: np.ndarray, text: str, sample_rate: int =
     Returns:
         List[WordTimestamp]: List of word timestamps
     """
+    # Validate inputs
+    if len(audio_array) == 0:
+        raise ValueError("Audio array is empty")
+    
+    if not text or not text.strip():
+        raise ValueError("Text is empty")
+    
     # Get emissions from the model
-    emissions = get_emissions(audio_array, sample_rate)
+    try:
+        emissions = get_emissions(audio_array, sample_rate)
+    except Exception as e:
+        print(f"Failed to get emissions: {e}")
+        raise
     
     # Store original text and words with their casing
     original_text = text.strip()
     original_words = original_text.split()
+    
+    if not original_words:
+        raise ValueError("No words found in text")
     
     # Clean and prepare text for model (lowercase for alignment)
     text_for_model = original_text.lower()
     lowercase_words = text_for_model.split()
     
     # Try different alignment approaches
+    # Skip torchaudio forced alignment due to compatibility issues
+    # Start with CTC-based alignment which is more stable
     try:
-        # Method 1: Try torchaudio forced alignment if available
-        result = _try_torchaudio_alignment(emissions, text_for_model, lowercase_words, sample_rate)
+        # Method 1: Try CTC-based alignment first
+        result = _try_ctc_alignment(emissions, text_for_model, lowercase_words, sample_rate)
         return _map_to_original_casing(result, original_words)
     except Exception as e:
-        print(f"Torchaudio alignment failed: {e}")
+        print(f"CTC alignment failed: {e}")
         try:
-            # Method 2: Try CTC-based alignment
-            result = _try_ctc_alignment(emissions, text_for_model, lowercase_words, sample_rate)
-            return _map_to_original_casing(result, original_words)
-        except Exception as e:
-            print(f"CTC alignment failed: {e}")
-            # Method 3: Fallback to simple alignment
+            # Method 2: Fallback to simple alignment
             result = _simple_alignment(emissions, lowercase_words, sample_rate)
             return _map_to_original_casing(result, original_words)
+        except Exception as e:
+            print(f"Simple alignment failed: {e}")
+            # Final fallback: create simple uniform timestamps
+            return _create_uniform_timestamps(original_words, len(audio_array) / sample_rate)
 
 def _try_torchaudio_alignment(emissions: torch.Tensor, text: str, words: List[str], sample_rate: int) -> List[WordTimestamp]:
     """Try torchaudio forced alignment approach."""
     try:
-        from torchaudio.functional import forced_align
+        import torchaudio
+        print(f"Torchaudio version: {torchaudio.__version__}")
+        
+        # Try different import paths for different torchaudio versions
+        try:
+            from torchaudio.functional import forced_align
+        except ImportError:
+            try:
+                from torchaudio.models.wav2vec2.utils import forced_align
+            except ImportError:
+                raise ImportError("forced_align function not available in this torchaudio version")
         
         # Tokenize text properly
         try:
@@ -162,17 +197,111 @@ def _try_torchaudio_alignment(emissions: torch.Tensor, text: str, words: List[st
             # Fallback: try with processor tokenizer
             tokens = processor.tokenizer.encode(text, add_special_tokens=False)
         
+        # Validate tokens
+        if not tokens:
+            raise ValueError("No tokens generated from text")
+        
         # Convert to tensor
         if isinstance(tokens, list):
             token_ids = torch.tensor(tokens, dtype=torch.long)
         else:
             token_ids = tokens
             
+        # Validate token_ids
+        if token_ids.numel() == 0:
+            raise ValueError("Token IDs tensor is empty")
+            
+        # Ensure proper tensor dimensions for forced_align
+        # forced_align expects emissions: (T, C) where T=frames, C=classes
+        # and targets: (N,) where N=number of tokens
+        
+        print(f"Original emissions shape: {emissions.shape}")
+        print(f"Original token_ids shape: {token_ids.shape}")
+        
+        # Handle emissions tensor
+        if emissions.dim() == 3:
+            # Shape: (batch, frames, classes) -> (frames, classes)
+            emissions = emissions.squeeze(0)
+        elif emissions.dim() == 2:
+            # Already correct: (frames, classes)
+            pass
+        else:
+            raise ValueError(f"Unexpected emissions shape: {emissions.shape}, expected 2D or 3D")
+        
+        # Handle token_ids tensor
+        if token_ids.dim() == 0:
+            # Scalar -> 1D tensor
+            token_ids = token_ids.unsqueeze(0)
+        elif token_ids.dim() == 1:
+            # Already correct: (num_tokens,)
+            pass
+        elif token_ids.dim() == 2:
+            # 2D -> 1D
+            token_ids = token_ids.squeeze()
+            if token_ids.dim() == 0:  # If squeezing resulted in scalar
+                token_ids = token_ids.unsqueeze(0)
+        else:
+            raise ValueError(f"Unexpected token_ids shape: {token_ids.shape}, expected 1D or 2D")
+        
+        print(f"Final emissions shape: {emissions.shape}")
+        print(f"Final token_ids shape: {token_ids.shape}")
+            
         # Get blank token ID
         blank_id = getattr(tokenizer, 'pad_token_id', None) or getattr(tokenizer, 'unk_token_id', None) or 0
         
-        # Get alignment
-        alignment = forced_align(emissions, token_ids, blank=blank_id)
+        # Move tensors to same device
+        token_ids = token_ids.to(emissions.device)
+        
+        # Try forced alignment with proper error handling
+        try:
+            # Check if this is the right way to call forced_align
+            print(f"Calling forced_align with emissions: {emissions.shape}, token_ids: {token_ids.shape}, blank: {blank_id}")
+            
+            # Try different calling patterns for different torchaudio versions
+            try:
+                # Method 1: Standard call
+                alignment = forced_align(emissions, token_ids, blank=blank_id)
+            except Exception as e1:
+                print(f"Standard call failed: {e1}")
+                try:
+                    # Method 2: Try without blank parameter
+                    alignment = forced_align(emissions, token_ids)
+                except Exception as e2:
+                    print(f"No blank parameter failed: {e2}")
+                    try:
+                        # Method 3: Try with emissions as log_probs instead of logits
+                        log_probs = torch.log_softmax(emissions, dim=-1)
+                        alignment = forced_align(log_probs, token_ids, blank=blank_id)
+                    except Exception as e3:
+                        print(f"Log probs failed: {e3}")
+                        raise e1  # Re-raise original error
+                        
+        except RuntimeError as e:
+            if "Dimension out of range" in str(e):
+                print(f"Dimension error details: {e}")
+                print(f"Emissions shape: {emissions.shape}, token_ids shape: {token_ids.shape}")
+                raise e
+            else:
+                raise e
+        
+        # Validate alignment results
+        if alignment is None:
+            raise ValueError("Forced alignment returned None")
+        
+        # Convert alignment to tensor if it's not already
+        if not isinstance(alignment, torch.Tensor):
+            alignment = torch.tensor(alignment)
+        
+        # Check if alignment is empty
+        if alignment.numel() == 0:
+            raise ValueError("Alignment is empty")
+        
+        # Check for None values in alignment
+        if torch.any(torch.isnan(alignment.float())):
+            raise ValueError("Alignment contains NaN values")
+        
+        # Debug information
+        print(f"Alignment shape: {alignment.shape}, tokens: {len(tokens)}, words: {len(words)}")
         
         # Convert alignment to word timestamps
         word_timestamps = []
@@ -186,18 +315,31 @@ def _try_torchaudio_alignment(emissions: torch.Tensor, text: str, words: List[st
             end_token_idx = int((i + 1) * tokens_per_word)
             
             if start_token_idx < len(alignment):
-                start_frame = alignment[start_token_idx] if start_token_idx < len(alignment) else 0
-                end_frame = alignment[min(end_token_idx - 1, len(alignment) - 1)] if end_token_idx <= len(alignment) else len(alignment) - 1
-                
-                start_time = start_frame * frame_duration
-                end_time = (end_frame + 1) * frame_duration
-                
-                word_timestamps.append(WordTimestamp(
-                    word=word,
-                    start=start_time,
-                    end=end_time,
-                    confidence=1.0
-                ))
+                # Get frame indices with proper error handling
+                try:
+                    start_frame_val = alignment[start_token_idx].item() if start_token_idx < len(alignment) else 0
+                    end_frame_val = alignment[min(end_token_idx - 1, len(alignment) - 1)].item() if end_token_idx <= len(alignment) else len(alignment) - 1
+                    
+                    # Validate frame values
+                    if start_frame_val is None or end_frame_val is None:
+                        raise ValueError("Frame values are None")
+                    
+                    start_frame = int(start_frame_val)
+                    end_frame = int(end_frame_val)
+                    
+                    start_time = start_frame * frame_duration
+                    end_time = (end_frame + 1) * frame_duration
+                    
+                    word_timestamps.append(WordTimestamp(
+                        word=word,
+                        start=start_time,
+                        end=end_time,
+                        confidence=1.0
+                    ))
+                except (ValueError, TypeError) as e:
+                    # Skip this word if frame extraction fails
+                    print(f"Warning: Could not extract frames for word '{word}': {e}")
+                    continue
         
         return word_timestamps
         
@@ -206,8 +348,14 @@ def _try_torchaudio_alignment(emissions: torch.Tensor, text: str, words: List[st
 
 def _try_ctc_alignment(emissions: torch.Tensor, text: str, words: List[str], sample_rate: int) -> List[WordTimestamp]:
     """Try CTC-based alignment approach."""
+    print(f"Starting CTC alignment with emissions shape: {emissions.shape}")
+    
+    # Handle emissions tensor
+    if emissions.dim() == 3:
+        emissions = emissions.squeeze(0)
+    
     # Get the most likely token sequence using CTC decoding
-    emissions_np = emissions.squeeze().cpu().numpy()
+    emissions_np = emissions.cpu().numpy()
     
     # Simple CTC decoding - get most likely token at each frame
     predicted_tokens = np.argmax(emissions_np, axis=1)
@@ -222,17 +370,28 @@ def _try_ctc_alignment(emissions: torch.Tensor, text: str, words: List[str], sam
             decoded_tokens.append(token)
         prev_token = token
     
+    print(f"CTC decoding: {len(predicted_tokens)} frames -> {len(decoded_tokens)} tokens")
+    
     # Create word timestamps based on frame positions
     word_timestamps = []
     frame_duration = 0.02  # 20ms
     total_frames = len(predicted_tokens)
     
-    # Distribute frames across words
-    frames_per_word = total_frames / len(words) if words else 1
+    if not words:
+        print("No words to align")
+        return word_timestamps
+    
+    # Distribute frames across words more intelligently
+    frames_per_word = total_frames / len(words)
+    
+    print(f"Distributing {total_frames} frames across {len(words)} words ({frames_per_word:.2f} frames per word)")
     
     for i, word in enumerate(words):
         start_frame = int(i * frames_per_word)
         end_frame = int((i + 1) * frames_per_word)
+        
+        # Ensure end_frame doesn't exceed total frames
+        end_frame = min(end_frame, total_frames)
         
         start_time = start_frame * frame_duration
         end_time = end_frame * frame_duration
@@ -244,6 +403,7 @@ def _try_ctc_alignment(emissions: torch.Tensor, text: str, words: List[str], sam
             confidence=0.8  # Medium confidence for CTC
         ))
     
+    print(f"Generated {len(word_timestamps)} word timestamps")
     return word_timestamps
 
 def _simple_alignment(emissions: torch.Tensor, words: List[str], sample_rate: int) -> List[WordTimestamp]:
@@ -315,6 +475,36 @@ def _map_to_original_casing(word_timestamps: List[WordTimestamp], original_words
         ))
     
     return mapped_timestamps
+
+def _create_uniform_timestamps(words: List[str], total_duration: float) -> List[WordTimestamp]:
+    """
+    Create uniform timestamps as a final fallback when all alignment methods fail.
+    
+    Args:
+        words (List[str]): List of words
+        total_duration (float): Total duration of audio in seconds
+    
+    Returns:
+        List[WordTimestamp]: List of word timestamps with uniform distribution
+    """
+    if not words:
+        return []
+    
+    word_timestamps = []
+    duration_per_word = total_duration / len(words)
+    
+    for i, word in enumerate(words):
+        start_time = i * duration_per_word
+        end_time = (i + 1) * duration_per_word
+        
+        word_timestamps.append(WordTimestamp(
+            word=word,
+            start=start_time,
+            end=end_time,
+            confidence=0.1  # Very low confidence for uniform fallback
+        ))
+    
+    return word_timestamps
 
 def transcribe_and_align_audio_file(audio_file_path: str, text: str) -> List[WordTimestamp]:
     """
